@@ -7,9 +7,12 @@ from datetime import date, datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
+from .alias import AliasConflictError, check_alias_chains
 from .ixfr import IxfrReplayError, run_ixfr_replay
 from .rfc1982 import MAX_SERIAL
 from .schemas import (
+    AliasCheckCreate,
+    AliasCheckOut,
     AuditCreate,
     AuditListItem,
     AuditOut,
@@ -564,6 +567,46 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "message": str(exc),
                     "out_of_zone_owners": exc.owners,
                     "out_of_zone_ns_targets": exc.ns_targets,
+                },
+            ) from exc
+
+    @app.post(
+        "/api/zones/{zone}/alias-checks",
+        response_model=AliasCheckOut,
+        responses={
+            422: {
+                "description": (
+                    "同一 owner/type 存在冲突目标（reason=conflicting_targets，"
+                    "detail 列出冲突的属主名、类型与目标集合）；其余请求体字段"
+                    "校验失败同样返回 422"
+                ),
+            }
+        },
+    )
+    def create_alias_check(zone: str, payload: AliasCheckCreate) -> dict:
+        """DNS 别名链发布预检（仅计算，不写库）。
+
+        提交扁平 CNAME/DNAME 记录列表与待检查名称：同一 ``(owner, type)``
+        存在冲突目标时返回 422（完全相同的重复记录按一条处理）。对每个
+        名称逐跳解析——精确 CNAME 优先，否则选取最长的严格祖先 DNAME 并
+        把该祖先后缀替换为 DNAME 目标；每跳记录规则、来源与结果。名称
+        重复判为 ``loop``，超过 32 跳判为 ``hop_limit``，无可用别名时判为
+        ``terminal`` 并给出终止名是否位于本区。
+        """
+        zone_name = _normalize_zone(zone)
+        records = [
+            (rr.owner, rr.type, rr.class_, rr.ttl, rr.rdata)
+            for rr in payload.records
+        ]
+        try:
+            return check_alias_chains(zone_name, records, payload.names)
+        except AliasConflictError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
                 },
             ) from exc
 

@@ -1275,3 +1275,138 @@ class ZoneCutCheckOut(BaseModel):
         description="逐条违规记录（occluded/orphan_glue，按 owner/type/rdata 稳定排序）"
     )
     note: str
+
+
+# ---------- DNS 别名链发布预检 ----------
+
+#: 别名链预检接受的记录类型
+_ALIAS_TYPES = frozenset({"CNAME", "DNAME"})
+
+
+class AliasRR(BaseModel):
+    """单条 CNAME/DNAME 记录（别名链发布预检的最小单位）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description="属主名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签）",
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["CNAME"],
+        description="记录类型助记符（规范化：去首尾空白、转大写；仅允许 CNAME/DNAME）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: str = Field(
+        min_length=1,
+        examples=["web.example.net"],
+        description="别名目标名（规范化：同属主名规则——去首尾空白、去末尾根点、转小写）",
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        return normalize_rr_token(value)
+
+    @model_validator(mode="after")
+    def _normalize_alias_target(self) -> "AliasRR":
+        if self.type not in _ALIAS_TYPES:
+            raise ValueError("记录类型须为 CNAME 或 DNAME")
+        try:
+            self.rdata = validate_owner(self.rdata)
+        except ValueError as exc:
+            raise ValueError("非法的别名目标名") from exc
+        return self
+
+
+class AliasCheckCreate(BaseModel):
+    """DNS 别名链发布预检请求（仅计算，不写库）。"""
+
+    records: list[AliasRR] = Field(
+        max_length=4096,
+        description="扁平 CNAME/DNAME 记录列表（可为空、至多 4096 条；每条为 owner/type/class/ttl/rdata 五元组）",
+    )
+    names: list[str] = Field(
+        min_length=1,
+        max_length=4096,
+        description="待检查名称列表（至少 1 个、至多 4096 个；按属主名规则规范化，结果与提交顺序一致）",
+        examples=[["www.example.com", "ftp.example.com"]],
+    )
+
+    @field_validator("names")
+    @classmethod
+    def _check_names(cls, value: list[str]) -> list[str]:
+        return [validate_owner(item) for item in value]
+
+
+class AliasHop(BaseModel):
+    """别名链中的一跳：应用一条 CNAME/DNAME 规则得到的重写结果。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    hop: int = Field(ge=1, description="跳序号（从 1 起）")
+    from_: str = Field(alias="from", description="本跳出发的名称")
+    rule: Literal["cname", "dname"] = Field(description="本跳应用的规则")
+    source: str = Field(
+        description="所命中记录的属主名（CNAME 为精确匹配的当前名，DNAME 为最长的严格祖先名）"
+    )
+    target: str = Field(description="所命中记录的目标（rdata）")
+    result: str = Field(
+        description="本跳重写后的名称（CNAME 即目标；DNAME 为祖先后缀替换结果）"
+    )
+
+
+class AliasCheckResult(BaseModel):
+    """单个待检查名称的逐跳解析结果。"""
+
+    name: str = Field(description="规范化后的待检查名称")
+    outcome: Literal["terminal", "loop", "hop_limit"] = Field(
+        description="terminal=无可用别名解析终止；loop=解析中名称重复；hop_limit=超过最大跳数"
+    )
+    hops: list[AliasHop] = Field(description="逐跳记录（每跳给出规则、来源与结果）")
+    final: str = Field(
+        description="解析停止时的名称（terminal 为终止名，loop 为重复到的名称，hop_limit 为第 max_hops 跳后的名称）"
+    )
+    in_zone: bool | None = Field(
+        description="终止名是否位于本区（仅 outcome=terminal 时给出，其余为 null）"
+    )
+
+
+class AliasRecordCounts(BaseModel):
+    """提交记录的分类计数（cname + dname = total）。"""
+
+    total: int = Field(ge=0, description="提交的记录总数")
+    cname: int = Field(ge=0, description="CNAME 记录数")
+    dname: int = Field(ge=0, description="DNAME 记录数")
+
+
+class AliasCheckOut(BaseModel):
+    """DNS 别名链发布预检（200）响应体。"""
+
+    zone: str
+    max_hops: int = Field(description="单个名称允许跟随的最大跳数（超过判为 hop_limit）")
+    counts: AliasRecordCounts
+    results: list[AliasCheckResult] = Field(
+        description="逐名称解析结果（与请求 names 顺序一致）"
+    )
+    note: str

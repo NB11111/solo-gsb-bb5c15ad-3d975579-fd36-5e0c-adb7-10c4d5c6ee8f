@@ -2936,6 +2936,333 @@ def test_zone_cut_check_malformed_body_422(client, payload):
     assert resp.status_code == 422
 
 
+# ---------- DNS 别名链发布预检 ----------
+
+
+def _alias_rr(owner, rtype="CNAME", rrclass="IN", ttl=300, rdata="web.example.com"):
+    return {"owner": owner, "type": rtype, "class": rrclass, "ttl": ttl, "rdata": rdata}
+
+
+def test_alias_check_cname_chain_to_terminal(client):
+    records = [
+        _alias_rr("www.example.com", "CNAME", "IN", 300, "web.example.com"),
+        _alias_rr("web.example.com", "CNAME", "IN", 300, "web.cdn.example.com"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["www.example.com"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["max_hops"] == 32
+    assert body["counts"] == {"total": 2, "cname": 2, "dname": 0}
+    (result,) = body["results"]
+    assert result["name"] == "www.example.com"
+    assert result["outcome"] == "terminal"
+    assert result["final"] == "web.cdn.example.com"
+    assert result["in_zone"] is True
+    # 每跳记录规则、来源与结果
+    assert result["hops"] == [
+        {"hop": 1, "from": "www.example.com", "rule": "cname",
+         "source": "www.example.com", "target": "web.example.com",
+         "result": "web.example.com"},
+        {"hop": 2, "from": "web.example.com", "rule": "cname",
+         "source": "web.example.com", "target": "web.cdn.example.com",
+         "result": "web.cdn.example.com"},
+    ]
+
+
+def test_alias_check_terminal_out_of_zone(client):
+    # 终止名在区域外时 in_zone 为 false
+    records = [_alias_rr("www.example.com", "CNAME", "IN", 300, "cdn.example.net.")]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["www.example.com", "other.net"]},
+    )
+    assert resp.status_code == 200
+    first, second = resp.json()["results"]
+    assert first["final"] == "cdn.example.net" and first["in_zone"] is False
+    # 无记录名称立即终止（0 跳）
+    assert second["outcome"] == "terminal" and second["hops"] == []
+    assert second["final"] == "other.net" and second["in_zone"] is False
+
+
+def test_alias_check_dname_longest_ancestor_and_rewrite(client):
+    # 最长的严格祖先 DNAME 取胜，并把该祖先后缀替换为目标
+    records = [
+        _alias_rr("example.com", "DNAME", "IN", 3600, "example.net"),
+        _alias_rr("sub.example.com", "DNAME", "IN", 3600, "sub.example.net"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["a.b.sub.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["hops"][0] == {
+        "hop": 1, "from": "a.b.sub.example.com", "rule": "dname",
+        "source": "sub.example.com", "target": "sub.example.net",
+        "result": "a.b.sub.example.net",
+    }
+    assert result["outcome"] == "terminal" and result["in_zone"] is False
+
+
+def test_alias_check_dname_not_applied_at_exact_owner(client):
+    # DNAME 只作用于严格后代，属主名自身不匹配
+    records = [_alias_rr("sub.example.com", "DNAME", "IN", 3600, "example.net")]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["sub.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["outcome"] == "terminal"
+    assert result["hops"] == []
+    assert result["final"] == "sub.example.com" and result["in_zone"] is True
+
+
+def test_alias_check_cname_priority_over_dname(client):
+    # 当前名上同时可走精确 CNAME 与祖先 DNAME 时，CNAME 优先
+    records = [
+        _alias_rr("example.com", "DNAME", "IN", 3600, "example.net"),
+        _alias_rr("www.example.com", "CNAME", "IN", 300, "web.example.com"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["www.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["hops"][0]["rule"] == "cname"
+    assert result["hops"][0]["result"] == "web.example.com"
+    # web.example.com 无 CNAME，回退到祖先 DNAME 继续解析
+    assert result["hops"][1]["rule"] == "dname"
+    assert result["hops"][1]["source"] == "example.com"
+    assert result["hops"][1]["result"] == "web.example.net"
+    assert result["final"] == "web.example.net" and result["in_zone"] is False
+
+
+def test_alias_check_dname_then_cname_across_zones(client):
+    records = [
+        _alias_rr("example.com", "DNAME", "IN", 3600, "example.net"),
+        _alias_rr("ftp.example.net", "CNAME", "IN", 300, "cdn.example.net"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["ftp.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert [(h["rule"], h["result"]) for h in result["hops"]] == [
+        ("dname", "ftp.example.net"),
+        ("cname", "cdn.example.net"),
+    ]
+    assert result["outcome"] == "terminal" and result["in_zone"] is False
+
+
+def test_alias_check_loop(client):
+    records = [
+        _alias_rr("a.example.com", "CNAME", "IN", 300, "b.example.com"),
+        _alias_rr("b.example.com", "CNAME", "IN", 300, "a.example.com"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["a.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["outcome"] == "loop"
+    assert result["final"] == "a.example.com"  # 重复到的名称
+    assert result["in_zone"] is None
+    assert len(result["hops"]) == 2  # 回到起点的这一跳也记录在案
+
+
+def test_alias_check_self_loop_and_dname_loop(client):
+    records = [
+        _alias_rr("s.example.com", "CNAME", "IN", 300, "s.example.com"),
+        _alias_rr("sub.example.com", "DNAME", "IN", 3600, "sub.example.com"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["s.example.com", "a.sub.example.com"]},
+    )
+    assert resp.status_code == 200
+    first, second = resp.json()["results"]
+    assert first["outcome"] == "loop" and len(first["hops"]) == 1
+    # DNAME 目标与祖先后缀相同：重写结果不变，一跳即判 loop
+    assert second["outcome"] == "loop" and len(second["hops"]) == 1
+    assert second["hops"][0]["result"] == "a.sub.example.com"
+
+
+def test_alias_check_hop_limit(client):
+    # 33 条 CNAME 链：跟随满 32 跳后仍需继续，判为 hop_limit
+    records = [
+        _alias_rr(f"n{i:02d}.example.com", "CNAME", "IN", 300, f"n{i + 1:02d}.example.com")
+        for i in range(33)
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["n00.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["outcome"] == "hop_limit"
+    assert len(result["hops"]) == 32
+    assert result["final"] == "n32.example.com" and result["in_zone"] is None
+
+
+def test_alias_check_exactly_max_hops_terminates(client):
+    # 恰好 32 跳后无可用别名：正常 terminal，不判 hop_limit
+    records = [
+        _alias_rr(f"n{i:02d}.example.com", "CNAME", "IN", 300, f"n{i + 1:02d}.example.com")
+        for i in range(32)
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["n00.example.com"]},
+    )
+    assert resp.status_code == 200
+    (result,) = resp.json()["results"]
+    assert result["outcome"] == "terminal"
+    assert len(result["hops"]) == 32
+    assert result["final"] == "n32.example.com" and result["in_zone"] is True
+
+
+def test_alias_check_conflicting_targets_422(client):
+    records = [
+        _alias_rr("www.example.com", "CNAME", "IN", 300, "b.example.com"),
+        _alias_rr("www.example.com", "CNAME", "IN", 300, "a.example.com"),
+        _alias_rr("sub.example.com", "DNAME", "IN", 3600, "x.example.net"),
+        _alias_rr("sub.example.com", "DNAME", "IN", 3600, "y.example.net"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["unrelated.example.com"]},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "conflicting_targets"
+    assert detail["conflicts"] == [
+        {"owner": "sub.example.com", "type": "DNAME",
+         "targets": ["x.example.net", "y.example.net"]},
+        {"owner": "www.example.com", "type": "CNAME",
+         "targets": ["a.example.com", "b.example.com"]},
+    ]
+
+
+def test_alias_check_identical_duplicates_ok(client):
+    # 完全相同的重复记录按一条处理，不构成冲突
+    records = [
+        _alias_rr("www.example.com", "CNAME", "IN", 300, "web.example.com"),
+        _alias_rr("www.example.com", "CNAME", "IN", 600, "web.example.com"),
+    ]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["www.example.com"]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["results"][0]["outcome"] == "terminal"
+
+
+def test_alias_check_normalization(client):
+    # 属主/目标/待检查名的大小写与末尾根点差异被规范化消除，类型/类转大写
+    resp = client.post(
+        "/api/zones/Example.COM./alias-checks",
+        json={
+            "records": [
+                _alias_rr("WWW.EXAMPLE.COM.", "cname", "in", 300, " Web.Example.COM. "),
+            ],
+            "names": ["Www.Example.Com."],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "Example.COM."
+    (result,) = body["results"]
+    assert result["name"] == "www.example.com"
+    assert result["hops"][0]["target"] == "web.example.com"
+    assert result["final"] == "web.example.com" and result["in_zone"] is True
+
+
+def test_alias_check_multiple_names_in_order(client):
+    records = [_alias_rr("a.example.com", "CNAME", "IN", 300, "b.example.com")]
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": records, "names": ["missing.example.com", "a.example.com"]},
+    )
+    assert resp.status_code == 200
+    first, second = resp.json()["results"]
+    assert first["name"] == "missing.example.com" and first["outcome"] == "terminal"
+    assert second["name"] == "a.example.com" and second["final"] == "b.example.com"
+
+
+def test_alias_check_empty_records(client):
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={"records": [], "names": ["www.example.com"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["counts"] == {"total": 0, "cname": 0, "dname": 0}
+    (result,) = body["results"]
+    assert result["outcome"] == "terminal" and result["hops"] == []
+    assert result["in_zone"] is True
+
+
+def test_alias_check_not_persisted(client):
+    resp = client.post(
+        "/api/zones/example.com/alias-checks",
+        json={
+            "records": [_alias_rr("www.example.com", "CNAME", "IN", 300, "web.example.com")],
+            "names": ["www.example.com"],
+        },
+    )
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_alias_check_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/alias-checks",
+        json={"records": [], "names": ["www.example.com"]},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # 记录类型仅允许 CNAME/DNAME
+        {"records": [_alias_rr("www.example.com", "A", "IN", 300, "192.0.2.1")],
+         "names": ["www.example.com"]},
+        # 属主名非法
+        {"records": [_alias_rr("bad!owner.example.com")], "names": ["www.example.com"]},
+        # 别名目标名非法
+        {"records": [_alias_rr("www.example.com", "CNAME", "IN", 300, "bad target!")],
+         "names": ["www.example.com"]},
+        # TTL 越界
+        {"records": [_alias_rr("www.example.com", "CNAME", "IN", -1, "web.example.com")],
+         "names": ["www.example.com"]},
+        {"records": [_alias_rr("www.example.com", "CNAME", "IN", 2**31, "web.example.com")],
+         "names": ["www.example.com"]},
+        # 待检查名非法 / 为空
+        {"records": [], "names": ["bad!name.example.com"]},
+        {"records": [], "names": []},
+        # 缺字段 / 结构非法
+        {"records": []},
+        {"names": ["www.example.com"]},
+        {},
+        {"records": "not-a-list", "names": ["www.example.com"]},
+        "not-an-object",
+    ],
+)
+def test_alias_check_invalid_body_422(client, payload):
+    resp = client.post("/api/zones/example.com/alias-checks", json=payload)
+    assert resp.status_code == 422
+
+
 # ---------- 并发：串行化分配，不重复 serial ----------
 
 def test_concurrent_reservations_no_duplicate_serials(tmp_path):
