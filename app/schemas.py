@@ -1275,3 +1275,151 @@ class ZoneCutCheckOut(BaseModel):
         description="逐条违规记录（occluded/orphan_glue，按 owner/type/rdata 稳定排序）"
     )
     note: str
+
+
+# ---------- DNS 别名链发布预检 ----------
+
+#: 别名链预检接受的记录类型
+_ALIAS_RR_TYPES = frozenset({"CNAME", "DNAME"})
+
+
+class AliasRR(BaseModel):
+    """扁平别名记录（CNAME/DNAME）：别名链预检的最小单位。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description=(
+            "属主名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签）"
+        ),
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["CNAME"],
+        description="记录类型助记符（规范化：去首尾空白、转大写；限 CNAME/DNAME）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: str = Field(
+        min_length=1,
+        examples=["cdn.example.net"],
+        description=(
+            "别名目标名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签）"
+        ),
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        return normalize_rr_token(value)
+
+    @model_validator(mode="after")
+    def _normalize_alias_target(self) -> "AliasRR":
+        if self.type not in _ALIAS_RR_TYPES:
+            raise ValueError(f"记录类型须为 CNAME 或 DNAME（收到 {self.type}）")
+        try:
+            self.rdata = validate_owner(self.rdata)
+        except ValueError as exc:
+            raise ValueError("非法的别名目标名") from exc
+        return self
+
+
+class AliasCheckCreate(BaseModel):
+    """DNS 别名链发布预检请求（仅计算，不写库）。"""
+
+    records: list[AliasRR] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="扁平别名记录列表（可空、至多 4096 条；类型限 CNAME/DNAME）",
+    )
+    names: list[str] = Field(
+        min_length=1,
+        max_length=4096,
+        description="待检查名称列表（至少 1 个、至多 4096 个；按属主名规则规范化）",
+        examples=[["www.example.com", "ftp.sub.example.com"]],
+    )
+
+    @field_validator("names")
+    @classmethod
+    def _check_names(cls, value: list[str]) -> list[str]:
+        names: list[str] = []
+        for item in value:
+            try:
+                names.append(validate_owner(item))
+            except ValueError as exc:
+                raise ValueError("非法的待检查名称") from exc
+        return names
+
+
+class AliasHop(BaseModel):
+    """别名链中的单跳。"""
+
+    hop: int = Field(ge=1, description="跳数序号（从 1 起）")
+    rule: Literal["cname", "dname"] = Field(
+        description="本跳应用的规则：cname=精确 CNAME；dname=最长严格祖先 DNAME 前缀替换"
+    )
+    source: str = Field(
+        description="匹配记录的属主名（cname 为当前名称本身，dname 为最长严格祖先）"
+    )
+    target: str = Field(description="匹配记录的目标名（rdata）")
+    result: str = Field(description="本跳得到的名称")
+
+
+class AliasTerminal(BaseModel):
+    """解析终结信息（无可用别名记录时）。"""
+
+    name: str = Field(description="终结名称")
+    in_zone: bool = Field(description="终结名称是否位于本区")
+
+
+class AliasCheckResult(BaseModel):
+    """单个待检查名称的解析结果。"""
+
+    name: str = Field(description="待检查名称（规范化后）")
+    status: Literal["terminal", "loop", "hop_limit"] = Field(
+        description="terminal=无可用别名终结；loop=名称重复成环；hop_limit=超过 32 跳未终结"
+    )
+    hops: list[AliasHop] = Field(description="逐跳记录（规则、来源、目标与结果）")
+    terminal: AliasTerminal | None = Field(
+        description="status 为 terminal 时的终结信息；loop/hop_limit 时为 null"
+    )
+    message: str = Field(description="该名称解析结论的说明")
+
+
+class AliasCheckSummary(BaseModel):
+    """逐状态计数（terminal + loop + hop_limit = total）。"""
+
+    total: int = Field(ge=0, description="待检查名称总数")
+    terminal: int = Field(ge=0, description="正常终结的名称数")
+    loop: int = Field(ge=0, description="判为别名环的名称数")
+    hop_limit: int = Field(ge=0, description="超过跳数上限的名称数")
+
+
+class AliasCheckOut(BaseModel):
+    """DNS 别名链发布预检（200）响应体。"""
+
+    zone: str
+    results: list[AliasCheckResult] = Field(
+        description="逐名称解析结果（与请求 names 顺序一致）"
+    )
+    summary: AliasCheckSummary
+    note: str

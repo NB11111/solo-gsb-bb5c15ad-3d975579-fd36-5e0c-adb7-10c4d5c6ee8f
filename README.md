@@ -15,6 +15,7 @@
 - 提供 **IXFR 增量回放预演**（`POST /api/zones/{zone}/ixfr-replays`，仅预演不写库）：提交起始 serial、初始 RRset 集合与有序 delta 列表，校验 serial 链（每个 delta 的 `from_serial` 必须等于当前 serial、`to_serial` 必须为 RFC 1982 有效前进），RR 规范化后以 `(owner, type, class, ttl, rdata)` 五元组为同一性判据，单个 delta 内**先删除再新增**；删除不存在的 RR 或新增已存在的 RR 时返回 **409** 并给出 delta 下标、失败操作与该 delta 前的完整快照（该 delta 原子作废，不留半步修改）；成功时返回最终 serial、规范化快照与每步增删计数。
 - 提供 **ZSK 双签轮换时序校验**（`POST /api/zones/{zone}/dnssec-rollover-checks`，仅校验不写库）：提交新钥发布/启签、旧钥停签/移除四个 UTC 时刻（须严格递增，否则 **422**）与 DNSKEY TTL、区记录最大 TTL、允许时钟偏差，校验"发布 → 启签至少等待 `DNSKEY TTL + 时钟偏差`、停签 → 移除至少等待 `区记录最大 TTL + 时钟偏差`"；返回 `safe`、两阶段实际/要求秒数与最早安全时间，等待不足仍返回 **200** 并按阶段顺序列出 `violations`。
 - 提供 **区域切割与胶水记录预检**（`POST /api/zones/{zone}/zone-cut-checks`，仅计算不写库）：提交扁平 RR 列表，非区域顶点的 NS 记录被识别为委派切割，每条记录按最长后缀定位最近切割——切割点 NS 保留为 `authoritative`，切割下普通记录标为 `occluded`，只有 owner 恰为该委派 NS 目标且类型为 A/AAAA 的区内记录保留为 `glue`，未被该委派引用的切割下地址记录标为 `orphan_glue`；返回规范化后的 `authoritative_records`、`glue_records`、逐条 `violations` 与分类计数（均按 owner/type/rdata 稳定排序）；区域外 owner 或 NS 目标返回 **422**。
+- 提供 **DNS 别名链发布预检**（`POST /api/zones/{zone}/alias-checks`，仅计算不写库）：提交 CNAME/DNAME 记录与待检查名称，对每个名称逐跳解析——精确 CNAME 优先，否则选取最长的严格祖先 DNAME 并用其目标替换匹配到的祖先部分，每跳记录规则、来源、目标与结果；名称重复判为 `loop`，超过 32 跳判为 `hop_limit`，无可用别名时为 `terminal` 并报告终结名称是否位于本区；同一 owner/type 存在冲突目标时返回 **422**。
 
 ## 快速启动（单条命令）
 
@@ -55,6 +56,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/ixfr-replays` | IXFR 增量回放预演，不写库（200；删除不存在/新增已存在的 RR 返回 409；serial 链非法返回 422） |
 | `POST` | `/api/zones/{zone}/dnssec-rollover-checks` | ZSK 双签轮换时序校验，不写库（200，等待不足仍返回 200 并列出 violations；四个时刻未严格递增返回 422） |
 | `POST` | `/api/zones/{zone}/zone-cut-checks` | 区域切割与胶水记录预检，不写库（200；区域外属主或 NS 目标返回 422） |
+| `POST` | `/api/zones/{zone}/alias-checks` | DNS 别名链发布预检，不写库（200；同一 owner/type 冲突目标返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -812,6 +814,98 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/zone-cut-checks \
 - 嵌套委派（如 `sub.example.com` 与 `deep.sub.example.com`）按**最长后缀**归属最近切割：切割下的地址记录只被**该**委派的 NS 目标引用才算 glue；
 - 属主在区域外、或任一 NS 记录的目标在区域外时返回 **422**，`detail` 分别列出 `out_of_zone_owners` 与 `out_of_zone_ns_targets`（含提交下标）；属主/类型/类/TTL/rdata 非法、NS 目标名非法等请求体问题同样返回 **422**；路径中区域名非法返回 **400**。
 
+### DNS 别名链发布预检
+
+`POST /api/zones/{zone}/alias-checks` 用于**发布前**检查一批 CNAME/DNAME 记录会把名称解析到何处：提交别名记录与待检查名称，服务端对每个名称独立**逐跳解析**并报告结局。结果**仅即时计算，不写入数据库**（不会产生审计或预留记录）。启动服务见上文[快速启动](#快速启动单条命令)（`docker compose up --build`）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `records` | 扁平别名记录列表（可空、至多 4096 条）；每条含 `owner`、`type`（限 `CNAME`/`DNAME`）、`class`、`ttl`（`0..2147483647`）与单条 `rdata`（别名目标名） |
+| `names` | 待检查名称列表（至少 1 个、至多 4096 个） |
+
+规范化规则（与区域切割预检一致）：`owner`、`rdata` 目标名与 `names` 去首尾空白、去末尾根点并转小写（允许前导下划线标签）；`type` / `class` 去首尾空白并转大写。记录属主与目标名不限于本区（区外 CDN 等后续别名可一并提交检查）。
+
+逐跳解析规则：
+
+1. **精确 CNAME 优先**：当前名称存在 CNAME 记录时，按该记录目标改写；
+2. **最长严格祖先 DNAME**：否则在当前名称的严格祖先（父域、祖父域……）中选取最长的、存在 DNAME 记录的属主名，用其目标替换名称中匹配到的祖先部分（保留下级相对名）——当前名称自身的 DNAME 不参与匹配（DNAME 只作用于严格后代）；
+3. **终结**：两者都不存在时 `status=terminal`，`terminal.in_zone` 报告终结名称是否位于本区。
+
+保护规则：解析结果回到本链已访问过的名称时 `status=loop`；需要超过 **32** 跳才能终结时 `status=hop_limit`（保留已执行的 32 跳记录）。每一跳记录 `rule`（`cname`/`dname`）、`source`（匹配记录的属主名）、`target`（记录目标）与 `result`（本跳得到的名称）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/alias-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "records": [
+          {"owner": "www.example.com", "type": "CNAME", "class": "IN", "ttl": 300,
+           "rdata": "cdn.example.net."},
+          {"owner": "sub.example.com", "type": "DNAME", "class": "IN", "ttl": 300,
+           "rdata": "target.example.net."},
+          {"owner": "loop-a.example.com", "type": "CNAME", "class": "IN", "ttl": 300,
+           "rdata": "loop-b.example.com."},
+          {"owner": "loop-b.example.com", "type": "CNAME", "class": "IN", "ttl": 300,
+           "rdata": "loop-a.example.com."}
+        ],
+        "names": ["www.example.com", "ftp.sub.example.com", "loop-a.example.com", "plain.example.com"]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "results": [
+    {"name": "www.example.com", "status": "terminal",
+     "hops": [
+       {"hop": 1, "rule": "cname", "source": "www.example.com",
+        "target": "cdn.example.net", "result": "cdn.example.net"}
+     ],
+     "terminal": {"name": "cdn.example.net", "in_zone": false},
+     "message": "名称终结于 cdn.example.net（不在本区），无可用别名记录"},
+    {"name": "ftp.sub.example.com", "status": "terminal",
+     "hops": [
+       {"hop": 1, "rule": "dname", "source": "sub.example.com",
+        "target": "target.example.net", "result": "ftp.target.example.net"}
+     ],
+     "terminal": {"name": "ftp.target.example.net", "in_zone": false},
+     "message": "名称终结于 ftp.target.example.net（不在本区），无可用别名记录"},
+    {"name": "loop-a.example.com", "status": "loop",
+     "hops": [
+       {"hop": 1, "rule": "cname", "source": "loop-a.example.com",
+        "target": "loop-b.example.com", "result": "loop-b.example.com"},
+       {"hop": 2, "rule": "cname", "source": "loop-b.example.com",
+        "target": "loop-a.example.com", "result": "loop-a.example.com"}
+     ],
+     "terminal": null,
+     "message": "解析结果 loop-a.example.com 在本链中已访问过，构成别名环"},
+    {"name": "plain.example.com", "status": "terminal", "hops": [],
+     "terminal": {"name": "plain.example.com", "in_zone": true},
+     "message": "名称终结于 plain.example.com（位于本区），无可用别名记录"}
+  ],
+  "summary": {"total": 4, "terminal": 3, "loop": 1, "hop_limit": 0},
+  "note": "预检结果仅依据本次请求即时计算，不写入数据库；逐跳解析时精确 CNAME 优先，否则选取最长的严格祖先 DNAME 并用其目标替换匹配到的祖先部分；名称重复判为 loop，超过 32 跳判为 hop_limit，无可用别名时为 terminal 并报告终结名称是否位于本区"
+}
+```
+
+- `results[]` 与请求 `names` 顺序一致；`terminal` 仅在 `status=terminal` 时出现（`loop`/`hop_limit` 时为 `null`）；`summary` 给出逐状态计数；
+- **冲突目标（422）**：同一 `owner`/`type` 出现不同目标时返回 **422**，`detail.reason` 为 `conflicting_alias_targets`，`detail.conflicts` 按 (owner, type) 字典序列出冲突的属主名、类型与目标集合；规范化后目标完全相同的重复记录视为一条，CNAME 与 DNAME 分属不同类型、同一属主下互不构成冲突：
+
+```json
+{
+  "detail": {
+    "reason": "conflicting_alias_targets",
+    "message": "1 个 owner/type 存在冲突目标（同一属主名与记录类型的目标不唯一）",
+    "conflicts": [
+      {"owner": "www.example.com", "type": "CNAME", "targets": ["a.example.net", "b.example.net"]}
+    ]
+  }
+}
+```
+
+- 记录类型非 CNAME/DNAME、别名目标名/待检查名称非法、`names` 为空、`ttl` 越界等请求体问题返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -853,6 +947,7 @@ app/
   ixfr.py      # IXFR 增量回放预演（不落库）
   rollover.py    # ZSK 双签轮换时序校验（不落库）
   zonecut.py   # 区域切割与胶水记录预检（不落库）
+  alias.py     # DNS 别名链发布预检（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验
